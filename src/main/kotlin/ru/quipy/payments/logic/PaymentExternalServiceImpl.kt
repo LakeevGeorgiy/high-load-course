@@ -12,6 +12,9 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import io.github.resilience4j.bulkhead.Bulkhead
+import io.github.resilience4j.bulkhead.BulkheadConfig
+import io.github.resilience4j.bulkhead.BulkheadFullException
 
 
 // Advice: always treat time as a Duration
@@ -34,7 +37,11 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val rate_limiter = SlidingWindowRateLimiter(10, java.time.Duration.ofMillis(1000));
+    private val rate_limiter = SlidingWindowRateLimiter(rateLimitPerSec * 1L, Duration.ofMillis(1000))
+    private val bulkhead = Bulkhead.of("http-client", BulkheadConfig.custom()
+        .maxConcurrentCalls(5)
+        .maxWaitDuration(Duration.ofMillis(60_000))
+        .build())
 
     private val client = OkHttpClient.Builder().build()
 
@@ -51,28 +58,29 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        rate_limiter.tickBlocking()
-
         try {
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
             }.build()
 
-            client.newCall(request).execute().use { response ->
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
-                }
+            bulkhead.executeCallable {
+                rate_limiter.tickBlocking()
+                client.newCall(request).execute().use { response ->
+                    val body = try {
+                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                    } catch (e: Exception) {
+                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+                    }
 
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    }
                 }
             }
         } catch (e: Exception) {
