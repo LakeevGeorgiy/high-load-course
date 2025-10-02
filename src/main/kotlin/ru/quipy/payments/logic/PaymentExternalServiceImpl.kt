@@ -2,6 +2,11 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.bulkhead.Bulkhead
+import io.github.resilience4j.bulkhead.BulkheadConfig
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.MeterRegistry
+import io.prometheus.metrics.model.registry.PrometheusRegistry
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -12,9 +17,6 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import io.github.resilience4j.bulkhead.Bulkhead
-import io.github.resilience4j.bulkhead.BulkheadConfig
-import io.github.resilience4j.bulkhead.BulkheadFullException
 
 
 // Advice: always treat time as a Duration
@@ -23,6 +25,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    metricRegistry: MeterRegistry
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -42,6 +45,11 @@ class PaymentExternalSystemAdapterImpl(
         .maxConcurrentCalls(5)
         .maxWaitDuration(Duration.ofMillis(60_000))
         .build())
+
+    private val sent_to_bank: Counter = Counter
+        .builder("sent_request_to_bank")
+        .tags("account_name", accountName)
+        .register(metricRegistry)
 
     private val client = OkHttpClient.Builder().build()
 
@@ -66,12 +74,13 @@ class PaymentExternalSystemAdapterImpl(
 
             bulkhead.executeCallable {
                 rate_limiter.tickBlocking()
+                sent_to_bank.increment()
                 client.newCall(request).execute().use { response ->
                     val body = try {
                         mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                     } catch (e: Exception) {
                         logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                     }
 
                     logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
