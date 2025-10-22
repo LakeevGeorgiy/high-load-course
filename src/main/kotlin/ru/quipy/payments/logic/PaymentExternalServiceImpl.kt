@@ -42,8 +42,8 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
     private val rate_limiter = SlidingWindowRateLimiter(rateLimitPerSec * 1L, Duration.ofMillis(1000))
     private val bulkhead = Bulkhead.of("http-client", BulkheadConfig.custom()
-        .maxConcurrentCalls(5)
-        .maxWaitDuration(Duration.ofMillis(60_000))
+        .maxConcurrentCalls(parallelRequests)
+        .maxWaitDuration(Duration.ofMillis(30_000))
         .build())
 
     private val sent_to_bank: Counter = Counter
@@ -72,25 +72,27 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
+
             bulkhead.executeCallable {
                 rate_limiter.tickBlocking()
-                sent_to_bank.increment()
-                client.newCall(request).execute().use { response ->
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
 
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                    sent_to_bank.increment()
+                    client.newCall(request).execute().use { response ->
+                        val body = try {
+                            mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        } catch (e: Exception) {
+                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                        }
 
-                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+                        // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+                        // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        }
                     }
-                }
             }
         } catch (e: Exception) {
             when (e) {
