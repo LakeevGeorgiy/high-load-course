@@ -1,17 +1,19 @@
 package ru.quipy.apigateway
 
-import jdk.jfr.internal.handlers.EventHandler.timestamp
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
+import ru.quipy.common.utils.CompositeRateLimiter
 import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 @RestController
 class APIController {
@@ -33,7 +35,18 @@ class APIController {
 
     data class User(val id: UUID, val name: String)
 
-    private val rateLimiter = SlidingWindowRateLimiter(11, Duration.ofSeconds(1))
+    private val rateLimiter =
+            TokenBucketRateLimiter(
+                rate = 11,
+                bucketMaxCapacity = 132,
+                window = 1,
+                timeUnit = TimeUnit.SECONDS
+            )
+
+    fun dropRequest(): ResponseEntity<PaymentSubmissionDto> {
+        val now = System.currentTimeMillis() + 2500
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).header("Retry-After", now.toString()).build()
+    }
 
     @PostMapping("/orders")
     fun createOrder(@RequestParam userId: UUID, @RequestParam price: Int): Order {
@@ -69,9 +82,12 @@ class APIController {
             it
         } ?: throw IllegalArgumentException("No such order $orderId")
 
+        if (!rateLimiter.tick()) {
+            return dropRequest()
+        }
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
         if (createdAt == -1L) {
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).build()
+            return dropRequest()
         }
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
