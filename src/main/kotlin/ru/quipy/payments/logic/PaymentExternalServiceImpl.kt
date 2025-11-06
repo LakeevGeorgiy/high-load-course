@@ -5,11 +5,13 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.github.resilience4j.bulkhead.Bulkhead
 import io.github.resilience4j.bulkhead.BulkheadConfig
 import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.DistributionSummary
 import io.micrometer.core.instrument.MeterRegistry
-import io.prometheus.metrics.model.registry.PrometheusRegistry
+import io.prometheus.metrics.core.metrics.Summary
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
+import okhttp3.Response
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -17,7 +19,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import kotlin.math.log
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -52,7 +54,19 @@ class PaymentExternalSystemAdapterImpl(
         .tags("account_name", accountName)
         .register(metricRegistry)
 
-    private val client = OkHttpClient.Builder().build()
+    private val repeat_request: Counter = Counter
+        .builder("repeat_request")
+        .register(metricRegistry)
+
+    var requestLatency: DistributionSummary = DistributionSummary
+        .builder("request_latency")
+        .publishPercentiles( 0.9, 0.99, 0.999, 0.9999)
+        .register(metricRegistry)
+
+    private val client = OkHttpClient.Builder()
+        .callTimeout(1350, TimeUnit.MILLISECONDS)
+        .build()
+
     private var orderMap = HashMap<UUID, Long>()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -74,7 +88,8 @@ class PaymentExternalSystemAdapterImpl(
             }
             val deadline: Long = orderMap[paymentId] ?: 0
             Thread.sleep(deadline)
-            orderMap[paymentId] = deadline + requestAverageProcessingTime.toMillis()
+            orderMap[paymentId] = 0
+            repeat_request.increment()
         }
     }
 
@@ -113,26 +128,34 @@ class PaymentExternalSystemAdapterImpl(
             rate_limiter.tickBlocking()
 
             sent_to_bank.increment()
+            val startTime = now()
+
             client.newCall(request).execute().use { response ->
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                }
-
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                }
-
-                result = body.result
+                result = handleResult(response, transactionId, paymentId)
             }
+
+            requestLatency.record((now() - startTime).toDouble())
         }
         return result
+    }
+
+    fun handleResult(response: Response, transactionId: UUID, paymentId: UUID): Boolean {
+        val body = try {
+            mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+        } catch (e: Exception) {
+            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+        }
+
+        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+        // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+        // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+        paymentESService.update(paymentId) {
+            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+        }
+
+        return body.result
     }
 
     override fun price() = properties.price
