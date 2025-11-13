@@ -52,8 +52,8 @@ class OrderPayer {
                 )
             }
 
-                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
         return createdAt
     }
