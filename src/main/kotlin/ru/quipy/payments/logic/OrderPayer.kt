@@ -29,8 +29,8 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
+        50,
+        50,
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(480),
@@ -52,8 +52,8 @@ class OrderPayer {
                 )
             }
 
-                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
         return createdAt
     }

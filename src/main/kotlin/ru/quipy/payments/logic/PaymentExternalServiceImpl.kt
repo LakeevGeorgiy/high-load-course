@@ -133,7 +133,6 @@ class PaymentExternalSystemAdapterImpl(
             client.newCall(request).execute().use { response ->
                 result = handleResult(response, transactionId, paymentId)
             }
-
             requestLatency.record((now() - startTime).toDouble())
         }
         return result
