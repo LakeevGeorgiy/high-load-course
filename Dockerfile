@@ -1,4 +1,4 @@
-FROM eclipse-temurin:17-alpine-3.22. AS build
+FROM openjdk:17-jdk-slim AS build
 
 WORKDIR /app
 COPY pom.xml .

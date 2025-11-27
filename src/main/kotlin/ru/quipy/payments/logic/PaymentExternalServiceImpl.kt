@@ -81,33 +81,31 @@ class PaymentExternalSystemAdapterImpl(
 
     private val connectionPool = ConnectionPool(
         maxIdleConnections = 20,
-        keepAliveDuration = 7,
+        keepAliveDuration = 5,
         timeUnit = TimeUnit.MINUTES,
     )
 
     private val client = OkHttpClient.Builder()
         .retryOnConnectionFailure(true)
-        .connectTimeout(23_000, TimeUnit.MILLISECONDS)
-        .readTimeout(23_000, TimeUnit.MILLISECONDS)
-        .writeTimeout(23_000, TimeUnit.MILLISECONDS)
-        .callTimeout(23_000, TimeUnit.MILLISECONDS)
+        .connectTimeout(13_000, TimeUnit.MILLISECONDS)
+        .readTimeout(13_000, TimeUnit.MILLISECONDS)
+        .writeTimeout(13_000, TimeUnit.MILLISECONDS)
+        .callTimeout(13_000, TimeUnit.MILLISECONDS)
         .connectionPool(connectionPool)
         .dispatcher(dispatcher)
         .build()
 
     private val databaseThreadPool = ThreadPoolExecutor(
         20,
-        50,
-        0L,
-        TimeUnit.MILLISECONDS,
+        20,
+        7L,
+        TimeUnit.MINUTES,
         LinkedBlockingQueue(500_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
 
     private var orderMap = HashMap<UUID, Long>()
-
-
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
