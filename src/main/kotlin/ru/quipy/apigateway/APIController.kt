@@ -38,14 +38,14 @@ class APIController {
 
     private val rateLimiter =
             TokenBucketRateLimiter(
-                rate = 100,
-                bucketMaxCapacity = 275,
+                rate = 1000,
+                bucketMaxCapacity = 100_000,
                 window = 1,
                 timeUnit = TimeUnit.SECONDS
             )
 
     fun dropRequest(): ResponseEntity<PaymentSubmissionDto> {
-        val now = System.currentTimeMillis() + 700
+        val now = System.currentTimeMillis() + 20_000
         return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).header("Retry-After", now.toString()).build()
     }
 
