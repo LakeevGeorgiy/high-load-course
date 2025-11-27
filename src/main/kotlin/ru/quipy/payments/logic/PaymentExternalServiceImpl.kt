@@ -29,6 +29,7 @@ import java.sql.Time
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
@@ -81,31 +82,32 @@ class PaymentExternalSystemAdapterImpl(
 
     private val connectionPool = ConnectionPool(
         maxIdleConnections = 20,
-        keepAliveDuration = 5,
+        keepAliveDuration = 13,
         timeUnit = TimeUnit.MINUTES,
     )
 
     private val client = OkHttpClient.Builder()
         .retryOnConnectionFailure(true)
-        .connectTimeout(13_000, TimeUnit.MILLISECONDS)
-        .readTimeout(13_000, TimeUnit.MILLISECONDS)
-        .writeTimeout(13_000, TimeUnit.MILLISECONDS)
-        .callTimeout(13_000, TimeUnit.MILLISECONDS)
+        .connectTimeout(15_000, TimeUnit.MILLISECONDS)
+        .readTimeout(15_000, TimeUnit.MILLISECONDS)
+        .writeTimeout(15_000, TimeUnit.MILLISECONDS)
+        .callTimeout(23_000, TimeUnit.MILLISECONDS)
         .connectionPool(connectionPool)
         .dispatcher(dispatcher)
         .build()
 
-    private val databaseThreadPool = ThreadPoolExecutor(
+    private var orderMap = HashMap<UUID, Long>()
+
+    private val databaseThreadPool = ScheduledThreadPoolExecutor(
         20,
-        20,
-        7L,
-        TimeUnit.MINUTES,
-        LinkedBlockingQueue(500_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
-    )
+    ).apply {
+        setMaximumPoolSize(50)
+        setKeepAliveTime(10L, TimeUnit.MINUTES)
+        setRemoveOnCancelPolicy(true)
+    }
 
-    private var orderMap = HashMap<UUID, Long>()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -125,6 +127,30 @@ class PaymentExternalSystemAdapterImpl(
         bankPayment(transactionId, paymentId, amount, paymentStartedAt)
     }
 
+    fun sendRequestWithRetry(
+        transactionId: UUID,
+        paymentId: UUID,
+        request: Request,
+        paymentStartedAt: Long,
+        maxAttempts: Int = 3,
+        initialDelayMs: Long = 2_000L
+    ) {
+        fun attempt(attempt: Int, delayMs: Long) {
+            if (attempt > maxAttempts) return
+
+            sendRequest(transactionId, paymentId, request, paymentStartedAt) { success ->
+                if (!success && attempt < maxAttempts) {
+                    databaseThreadPool.schedule({
+                        attempt(attempt + 1, delayMs * 2)
+                    }, delayMs, TimeUnit.MILLISECONDS)
+                }
+            }
+        }
+
+        attempt(1, initialDelayMs)
+    }
+
+
     fun bankPayment(transactionId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long) {
         try {
             val request = Request.Builder().run {
@@ -132,7 +158,7 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
-            sendRequest(transactionId, paymentId, request, paymentStartedAt)
+            sendRequestWithRetry(transactionId, paymentId, request, paymentStartedAt)
         } catch (e: Exception) {
             databaseThreadPool.submit {
                 handleError(transactionId, paymentId, e)
@@ -140,7 +166,14 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    fun sendRequest(transactionId: UUID, paymentId: UUID, request: Request, paymentStartedAt: Long) {
+
+    fun sendRequest(
+        transactionId: UUID,
+        paymentId: UUID,
+        request: Request,
+        paymentStartedAt: Long,
+        onComplete: (Boolean) -> Unit
+    ) {
         bulkhead.executeCallable {
             rate_limiter.tickBlocking()
 
@@ -152,20 +185,23 @@ class PaymentExternalSystemAdapterImpl(
                     databaseThreadPool.submit {
                         handleError(transactionId, paymentId, e)
                         requestLatency.record((now() - startTime).toDouble())
+                        onComplete(false)
                     }
                 }
 
                 override fun onResponse(call: Call, response: Response) {
                     val responseCode = response.code
-                    val responseBody = response.body?.use { it.string() }?: ""
+                    val responseBody = response.body?.use { it.string() } ?: ""
                     databaseThreadPool.submit {
-                        handleSuccess(responseCode, responseBody, transactionId, paymentId)
+                        val success = handleSuccess(responseCode, responseBody, transactionId, paymentId)
                         requestLatency.record((now() - startTime).toDouble())
+                        onComplete(success)
                     }
                 }
             })
         }
     }
+
 
     private fun handleError(transactionId: UUID, paymentId: UUID, e: Exception) {
         logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
