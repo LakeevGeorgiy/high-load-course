@@ -81,7 +81,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private val connectionPool = ConnectionPool(
-        maxIdleConnections = 50,
+        maxIdleConnections = parallelRequests,
         keepAliveDuration = 13,
         timeUnit = TimeUnit.MINUTES,
     )
