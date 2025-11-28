@@ -81,22 +81,20 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private val connectionPool = ConnectionPool(
-        maxIdleConnections = 20,
+        maxIdleConnections = 50,
         keepAliveDuration = 13,
         timeUnit = TimeUnit.MINUTES,
     )
 
     private val client = OkHttpClient.Builder()
         .retryOnConnectionFailure(true)
-        .connectTimeout(15_000, TimeUnit.MILLISECONDS)
-        .readTimeout(15_000, TimeUnit.MILLISECONDS)
-        .writeTimeout(15_000, TimeUnit.MILLISECONDS)
-        .callTimeout(23_000, TimeUnit.MILLISECONDS)
+        .connectTimeout(5_000, TimeUnit.MILLISECONDS)
+        .readTimeout(5_000, TimeUnit.MILLISECONDS)
+        .writeTimeout(5_000, TimeUnit.MILLISECONDS)
+        .callTimeout(13_000, TimeUnit.MILLISECONDS)
         .connectionPool(connectionPool)
         .dispatcher(dispatcher)
         .build()
-
-    private var orderMap = HashMap<UUID, Long>()
 
     private val databaseThreadPool = ScheduledThreadPoolExecutor(
         20,
