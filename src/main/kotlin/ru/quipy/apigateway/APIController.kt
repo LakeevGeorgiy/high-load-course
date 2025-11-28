@@ -39,7 +39,7 @@ class APIController {
     private val rateLimiter =
             TokenBucketRateLimiter(
                 rate = 1000,
-                bucketMaxCapacity = 100_000,
+                bucketMaxCapacity = 1000,
                 window = 1,
                 timeUnit = TimeUnit.SECONDS
             )

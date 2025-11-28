@@ -76,8 +76,8 @@ class PaymentExternalSystemAdapterImpl(
         .register(metricRegistry)
 
     private val dispatcher = Dispatcher().apply {
-        maxRequests = 10_000
-        maxRequestsPerHost = 10_000
+        maxRequests = parallelRequests
+        maxRequestsPerHost = parallelRequests
     }
 
     private val connectionPool = ConnectionPool(
@@ -102,11 +102,7 @@ class PaymentExternalSystemAdapterImpl(
         20,
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
-    ).apply {
-        setMaximumPoolSize(50)
-        setKeepAliveTime(10L, TimeUnit.MINUTES)
-        setRemoveOnCancelPolicy(true)
-    }
+    )
 
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -160,8 +156,18 @@ class PaymentExternalSystemAdapterImpl(
 
             sendRequestWithRetry(transactionId, paymentId, request, paymentStartedAt)
         } catch (e: Exception) {
-            databaseThreadPool.submit {
-                handleError(transactionId, paymentId, e)
+            when (e) {
+                is SocketTimeoutException -> {
+                    databaseThreadPool.submit {
+                        handleTimeout(transactionId, paymentId, e)
+                    }
+                }
+                else -> {
+                    databaseThreadPool.submit {
+                        handleError(transactionId, paymentId, e)
+                    }
+                }
+
             }
         }
     }
@@ -190,18 +196,26 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 override fun onResponse(call: Call, response: Response) {
-                    val responseCode = response.code
-                    val responseBody = response.body?.use { it.string() } ?: ""
-                    databaseThreadPool.submit {
-                        val success = handleSuccess(responseCode, responseBody, transactionId, paymentId)
-                        requestLatency.record((now() - startTime).toDouble())
-                        onComplete(success)
+                    response.use {
+                        val responseCode = response.code
+                        val responseBody = response.body?.use { it.string() } ?: ""
+                        databaseThreadPool.submit {
+                            val success = handleSuccess(responseCode, responseBody, transactionId, paymentId)
+                            requestLatency.record((now() - startTime).toDouble())
+                            onComplete(success)
+                        }
                     }
                 }
             })
         }
     }
 
+    private fun handleTimeout(transactionId: UUID, paymentId: UUID, e: Exception) {
+        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+        paymentESService.update(paymentId) {
+            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+        }
+    }
 
     private fun handleError(transactionId: UUID, paymentId: UUID, e: Exception) {
         logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
