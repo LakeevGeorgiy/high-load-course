@@ -11,8 +11,10 @@ import io.prometheus.metrics.core.metrics.Summary
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.ConnectionPool
+import okhttp3.ConnectionSpec
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
@@ -81,7 +83,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private val connectionPool = ConnectionPool(
-        maxIdleConnections = parallelRequests,
+        maxIdleConnections = 50,
         keepAliveDuration = 13,
         timeUnit = TimeUnit.MINUTES,
     )
@@ -94,6 +96,7 @@ class PaymentExternalSystemAdapterImpl(
         .callTimeout(13_000, TimeUnit.MILLISECONDS)
         .connectionPool(connectionPool)
         .dispatcher(dispatcher)
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
         .build()
 
     private val databaseThreadPool = ScheduledThreadPoolExecutor(
