@@ -18,6 +18,7 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
+import okhttp3.TlsVersion
 import okhttp3.internal.wait
 import okio.IOException
 import org.slf4j.LoggerFactory
@@ -88,15 +89,24 @@ class PaymentExternalSystemAdapterImpl(
         timeUnit = TimeUnit.MINUTES,
     )
 
+    private val connectionSpecs = listOf(
+        ConnectionSpec.CLEARTEXT,  // Для HTTP (ваш случай)
+        ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
+            .tlsVersions(TlsVersion.TLS_1_3, TlsVersion.TLS_1_2)
+            .build()
+    )
+
     private val client = OkHttpClient.Builder()
         .retryOnConnectionFailure(true)
         .connectTimeout(5_000, TimeUnit.MILLISECONDS)
-        .readTimeout(5_000, TimeUnit.MILLISECONDS)
+        .readTimeout(5_000, TimeUnit.SECONDS)
         .writeTimeout(5_000, TimeUnit.MILLISECONDS)
         .callTimeout(13_000, TimeUnit.MILLISECONDS)
         .connectionPool(connectionPool)
         .dispatcher(dispatcher)
         .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+        .connectionSpecs(connectionSpecs)
+        .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
     private val databaseThreadPool = ScheduledThreadPoolExecutor(
@@ -138,7 +148,7 @@ class PaymentExternalSystemAdapterImpl(
             sendRequest(transactionId, paymentId, request, paymentStartedAt) { success ->
                 if (!success && attempt < maxAttempts) {
                     databaseThreadPool.schedule({
-                        attempt(attempt + 1, delayMs * 2)
+                        attempt(attempt + 1, delayMs)
                     }, delayMs, TimeUnit.MILLISECONDS)
                 }
             }
@@ -197,14 +207,16 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 override fun onResponse(call: Call, response: Response) {
+                    val responseCode: Int
+                    val responseBody: String
                     response.use {
-                        val responseCode = response.code
-                        val responseBody = response.body?.use { it.string() } ?: ""
-                        databaseThreadPool.submit {
-                            val success = handleSuccess(responseCode, responseBody, transactionId, paymentId)
-                            requestLatency.record((now() - startTime).toDouble())
-                            onComplete(success)
-                        }
+                        responseCode = response.code
+                        responseBody = response.body?.use { it.string() } ?: ""
+                    }
+                    databaseThreadPool.submit {
+                        val success = handleSuccess(responseCode, responseBody, transactionId, paymentId)
+                        requestLatency.record((now() - startTime).toDouble())
+                        onComplete(success)
                     }
                 }
             })
