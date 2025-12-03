@@ -4,50 +4,39 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.github.resilience4j.bulkhead.Bulkhead
 import io.github.resilience4j.bulkhead.BulkheadConfig
-import io.github.resilience4j.kotlin.bulkhead.executeSuspendFunction
 import io.ktor.client.HttpClient
-import io.ktor.client.engine.apache5.Apache5
+import io.ktor.client.engine.cio.CIO
 import io.ktor.client.engine.jetty.jakarta.Jetty
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
-import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
+import io.ktor.websocket.WebSocketDeflateExtension.Companion.install
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.DistributionSummary
 import io.micrometer.core.instrument.MeterRegistry
-import io.prometheus.metrics.core.metrics.Summary
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
-import kotlinx.coroutines.withContext
 import okhttp3.ConnectionPool
-import okhttp3.ConnectionSpec
-import okhttp3.Dispatcher
-import okhttp3.Protocol
-import okhttp3.Request
 import okhttp3.RequestBody
-import okhttp3.TlsVersion
-import okio.IOException
+import org.eclipse.jetty.http2.client.HTTP2Client
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.lang.Thread.sleep
 import java.net.SocketTimeoutException
-import java.sql.Time
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledThreadPoolExecutor
-import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import kotlin.concurrent.thread
 
 
 // Advice: always treat time as a Duration
@@ -91,32 +80,26 @@ class PaymentExternalSystemAdapterImpl(
         .publishPercentiles( 0.9, 0.99, 0.999, 0.9999)
         .register(metricRegistry)
 
-    private val dispatcher = Dispatcher().apply {
-        maxRequests = parallelRequests
-        maxRequestsPerHost = parallelRequests
-    }
+    private val dispatcherClient = Executors.newFixedThreadPool(20).asCoroutineDispatcher()
 
-    private val connectionPool = ConnectionPool(
+    private val connectionPoolClient = ConnectionPool(
         maxIdleConnections = 50,
         keepAliveDuration = 13,
         timeUnit = TimeUnit.MINUTES,
     )
 
-//    private val connectionSpecs = listOf(
-//        ConnectionSpec.CLEARTEXT,
-//        ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
-//            .tlsVersions(TlsVersion.TLS_1_3, TlsVersion.TLS_1_2)
-//            .build()
-//    )
-
-    private val client = HttpClient() {
+    private val client = HttpClient(Jetty) {
 
         install(HttpTimeout) {
             requestTimeoutMillis = 13_000L
             connectTimeoutMillis = 5_000L
-            socketTimeoutMillis = 5_000L
+            socketTimeoutMillis = 30_000L
         }
 
+        engine {
+            pipelining=true
+            dispatcher=dispatcherClient
+        }
     }
 
     private val databaseThreadPool = ScheduledThreadPoolExecutor(
