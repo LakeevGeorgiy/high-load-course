@@ -24,6 +24,7 @@
         <json-datatype.version>2.9.8</json-datatype.version>
         <caffeine.version>3.1.8</caffeine.version>
         <ktor.version>3.3.3</ktor.version>
+<!--        <httpclient5.version>5.3.1</httpclient5.version>-->
     </properties>
 
 	<dependencies>
@@ -42,6 +43,24 @@
         <dependency>
             <groupId>io.ktor</groupId>
             <artifactId>ktor-client-okhttp-jvm</artifactId>
+            <version>${ktor.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>io.ktor</groupId>
+            <artifactId>ktor-client-apache5-jvm</artifactId>
+            <version>${ktor.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.httpcomponents.client5</groupId>
+            <artifactId>httpclient5</artifactId>
+            <version>${httpclient5.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>io.ktor</groupId>
+            <artifactId>ktor-client-jetty-jakarta-jvm</artifactId>
             <version>${ktor.version}</version>
         </dependency>
 

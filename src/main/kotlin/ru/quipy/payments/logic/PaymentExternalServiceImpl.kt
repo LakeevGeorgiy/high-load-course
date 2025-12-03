@@ -6,6 +6,8 @@ import io.github.resilience4j.bulkhead.Bulkhead
 import io.github.resilience4j.bulkhead.BulkheadConfig
 import io.github.resilience4j.kotlin.bulkhead.executeSuspendFunction
 import io.ktor.client.HttpClient
+import io.ktor.client.engine.apache5.Apache5
+import io.ktor.client.engine.jetty.jakarta.Jetty
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
@@ -107,25 +109,12 @@ class PaymentExternalSystemAdapterImpl(
 //            .build()
 //    )
 
-    private val client = HttpClient(io.ktor.client.engine.okhttp.OkHttp) {
+    private val client = HttpClient() {
 
         install(HttpTimeout) {
             requestTimeoutMillis = 13_000L
             connectTimeoutMillis = 5_000L
             socketTimeoutMillis = 5_000L
-        }
-
-        engine {
-            config {
-                // Reuse your existing OkHttp configuration
-                retryOnConnectionFailure(true)
-
-                // ENABLE HTTP/2 PROTOCOLS
-                protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-
-                // Your existing connection pool
-                connectionPool(connectionPool)
-            }
         }
 
     }
@@ -158,15 +147,8 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private suspend fun bankPayment(transactionId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long) {
-        try {
-            val urlString = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
-            sendRequestWithRetry(transactionId, paymentId, urlString, paymentStartedAt)
-        } catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> handleTimeout(transactionId, paymentId, e)
-                else -> handleError(transactionId, paymentId, e)
-            }
-        }
+        val urlString = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
+        sendRequestWithRetry(transactionId, paymentId, urlString, paymentStartedAt)
     }
 
     private suspend fun sendRequestWithRetry(
@@ -175,30 +157,13 @@ class PaymentExternalSystemAdapterImpl(
         url: String,
         paymentStartedAt: Long,
     ) {
-        val maxAttempts = 3;
-        val currentDelay = 2_000
-        var attempt = 0
-
-        while (attempt < maxAttempts) {
-            try {
-                if (sendRequest(transactionId, paymentId, url, paymentStartedAt)) {
-                    return
-                }
-            } catch (e: Exception) {
-
-            }
-            attempt++
-            if (attempt == maxAttempts) {
-                return
-            }
-        }
+        sendRequest(transactionId, paymentId, url)
     }
 
     suspend fun sendRequest(
         transactionId: UUID,
         paymentId: UUID,
         url: String,
-        paymentStartedAt: Long
     ): Boolean {
         semaphore.withPermit {
             sent_to_bank.increment()
@@ -212,11 +177,12 @@ class PaymentExternalSystemAdapterImpl(
                     transactionId,
                     paymentId
                 )
-                requestLatency.record((now() - startTime).toDouble())
-                return true
+                return success
             } catch (e: Exception) {
-                requestLatency.record((now() - startTime).toDouble())
-                handleError(transactionId, paymentId, e)
+                when (e) {
+                    is SocketTimeoutException -> handleTimeout(transactionId, paymentId, e)
+                    else -> handleError(transactionId, paymentId, e)
+                }
                 return false
             }
         }
