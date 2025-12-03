@@ -4,22 +4,31 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.github.resilience4j.bulkhead.Bulkhead
 import io.github.resilience4j.bulkhead.BulkheadConfig
+import io.github.resilience4j.kotlin.bulkhead.executeSuspendFunction
+import io.ktor.client.HttpClient
+import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
+import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.bodyAsText
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.DistributionSummary
 import io.micrometer.core.instrument.MeterRegistry
 import io.prometheus.metrics.core.metrics.Summary
-import okhttp3.Call
-import okhttp3.Callback
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import okhttp3.ConnectionPool
 import okhttp3.ConnectionSpec
 import okhttp3.Dispatcher
-import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody
-import okhttp3.Response
 import okhttp3.TlsVersion
-import okhttp3.internal.wait
 import okio.IOException
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
@@ -27,6 +36,7 @@ import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.lang.Thread.sleep
 import java.net.SocketTimeoutException
 import java.sql.Time
 import java.time.Duration
@@ -35,6 +45,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 
 // Advice: always treat time as a Duration
@@ -89,31 +100,43 @@ class PaymentExternalSystemAdapterImpl(
         timeUnit = TimeUnit.MINUTES,
     )
 
-    private val connectionSpecs = listOf(
-        ConnectionSpec.CLEARTEXT,  // Для HTTP (ваш случай)
-        ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
-            .tlsVersions(TlsVersion.TLS_1_3, TlsVersion.TLS_1_2)
-            .build()
-    )
+//    private val connectionSpecs = listOf(
+//        ConnectionSpec.CLEARTEXT,
+//        ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
+//            .tlsVersions(TlsVersion.TLS_1_3, TlsVersion.TLS_1_2)
+//            .build()
+//    )
 
-    private val client = OkHttpClient.Builder()
-        .retryOnConnectionFailure(true)
-        .connectTimeout(5_000, TimeUnit.MILLISECONDS)
-        .readTimeout(5_000, TimeUnit.SECONDS)
-        .writeTimeout(5_000, TimeUnit.MILLISECONDS)
-        .callTimeout(13_000, TimeUnit.MILLISECONDS)
-        .connectionPool(connectionPool)
-        .dispatcher(dispatcher)
-        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-        .connectionSpecs(connectionSpecs)
-        .pingInterval(20, TimeUnit.SECONDS)
-        .build()
+    private val client = HttpClient(io.ktor.client.engine.okhttp.OkHttp) {
+
+        install(HttpTimeout) {
+            requestTimeoutMillis = 13_000L
+            connectTimeoutMillis = 5_000L
+            socketTimeoutMillis = 5_000L
+        }
+
+        engine {
+            config {
+                // Reuse your existing OkHttp configuration
+                retryOnConnectionFailure(true)
+
+                // ENABLE HTTP/2 PROTOCOLS
+                protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+
+                // Your existing connection pool
+                connectionPool(connectionPool)
+            }
+        }
+
+    }
 
     private val databaseThreadPool = ScheduledThreadPoolExecutor(
         20,
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
+
+    private val semaphore = Semaphore(permits = parallelRequests)
 
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -123,103 +146,79 @@ class PaymentExternalSystemAdapterImpl(
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-        databaseThreadPool.submit {
-            paymentESService.update(paymentId) {
-                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-            }
+        paymentESService.update(paymentId) {
+            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        bankPayment(transactionId, paymentId, amount, paymentStartedAt)
-    }
-
-    fun sendRequestWithRetry(
-        transactionId: UUID,
-        paymentId: UUID,
-        request: Request,
-        paymentStartedAt: Long,
-        maxAttempts: Int = 3,
-        initialDelayMs: Long = 2_000L
-    ) {
-        fun attempt(attempt: Int, delayMs: Long) {
-            if (attempt > maxAttempts) return
-
-            sendRequest(transactionId, paymentId, request, paymentStartedAt) { success ->
-                if (!success && attempt < maxAttempts) {
-                    databaseThreadPool.schedule({
-                        attempt(attempt + 1, delayMs)
-                    }, delayMs, TimeUnit.MILLISECONDS)
-                }
-            }
+        CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
+            bankPayment(transactionId, paymentId, amount, paymentStartedAt)
         }
-
-        attempt(1, initialDelayMs)
     }
 
-
-    fun bankPayment(transactionId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long) {
+    private suspend fun bankPayment(transactionId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long) {
         try {
-            val request = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
-
-            sendRequestWithRetry(transactionId, paymentId, request, paymentStartedAt)
+            val urlString = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
+            sendRequestWithRetry(transactionId, paymentId, urlString, paymentStartedAt)
         } catch (e: Exception) {
             when (e) {
-                is SocketTimeoutException -> {
-                    databaseThreadPool.submit {
-                        handleTimeout(transactionId, paymentId, e)
-                    }
-                }
-                else -> {
-                    databaseThreadPool.submit {
-                        handleError(transactionId, paymentId, e)
-                    }
-                }
-
+                is SocketTimeoutException -> handleTimeout(transactionId, paymentId, e)
+                else -> handleError(transactionId, paymentId, e)
             }
         }
     }
 
-
-    fun sendRequest(
+    private suspend fun sendRequestWithRetry(
         transactionId: UUID,
         paymentId: UUID,
-        request: Request,
+        url: String,
         paymentStartedAt: Long,
-        onComplete: (Boolean) -> Unit
     ) {
-        bulkhead.executeCallable {
-            rate_limiter.tickBlocking()
+        val maxAttempts = 3;
+        val currentDelay = 2_000
+        var attempt = 0
 
+        while (attempt < maxAttempts) {
+            try {
+                if (sendRequest(transactionId, paymentId, url, paymentStartedAt)) {
+                    return
+                }
+            } catch (e: Exception) {
+
+            }
+            attempt++
+            if (attempt == maxAttempts) {
+                return
+            }
+        }
+    }
+
+    suspend fun sendRequest(
+        transactionId: UUID,
+        paymentId: UUID,
+        url: String,
+        paymentStartedAt: Long
+    ): Boolean {
+        semaphore.withPermit {
             sent_to_bank.increment()
             val startTime = now()
 
-            client.newCall(request).enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    databaseThreadPool.submit {
-                        handleError(transactionId, paymentId, e)
-                        requestLatency.record((now() - startTime).toDouble())
-                        onComplete(false)
-                    }
-                }
-
-                override fun onResponse(call: Call, response: Response) {
-                    val responseCode: Int
-                    val responseBody: String
-                    response.use {
-                        responseCode = response.code
-                        responseBody = response.body?.use { it.string() } ?: ""
-                    }
-                    databaseThreadPool.submit {
-                        val success = handleSuccess(responseCode, responseBody, transactionId, paymentId)
-                        requestLatency.record((now() - startTime).toDouble())
-                        onComplete(success)
-                    }
-                }
-            })
+            try {
+                val response = client.post(url) { setBody("") }
+                val success = handleSuccess(
+                    response.status.value,
+                    response.bodyAsText(),
+                    transactionId,
+                    paymentId
+                )
+                requestLatency.record((now() - startTime).toDouble())
+                return true
+            } catch (e: Exception) {
+                requestLatency.record((now() - startTime).toDouble())
+                handleError(transactionId, paymentId, e)
+                return false
+            }
         }
     }
 
