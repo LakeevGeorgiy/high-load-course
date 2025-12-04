@@ -6,6 +6,7 @@ import io.github.resilience4j.bulkhead.Bulkhead
 import io.github.resilience4j.bulkhead.BulkheadConfig
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
+import io.ktor.client.engine.java.Java
 import io.ktor.client.engine.jetty.jakarta.Jetty
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.post
@@ -19,15 +20,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import okhttp3.ConnectionPool
 import okhttp3.RequestBody
-import org.eclipse.jetty.http2.client.HTTP2Client
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
-import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -35,11 +35,7 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledThreadPoolExecutor
-import java.util.concurrent.TimeUnit
 
-
-// Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
@@ -61,10 +57,6 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
     private val rate_limiter = SlidingWindowRateLimiter(rateLimitPerSec * 1L, Duration.ofMillis(1000))
-    private val bulkhead = Bulkhead.of("http-client", BulkheadConfig.custom()
-        .maxConcurrentCalls(parallelRequests)
-        .maxWaitDuration(Duration.ofMillis(1_000_000))
-        .build())
 
     private val sent_to_bank: Counter = Counter
         .builder("sent_request_to_bank")
@@ -80,20 +72,13 @@ class PaymentExternalSystemAdapterImpl(
         .publishPercentiles( 0.9, 0.99, 0.999, 0.9999)
         .register(metricRegistry)
 
-    private val dispatcherClient = Executors.newFixedThreadPool(20).asCoroutineDispatcher()
+    private val dispatcherClient = Executors.newFixedThreadPool(30).asCoroutineDispatcher()
+    private val dispatcherPayment = Executors.newFixedThreadPool(30).asCoroutineDispatcher()
 
-    private val connectionPoolClient = ConnectionPool(
-        maxIdleConnections = 50,
-        keepAliveDuration = 13,
-        timeUnit = TimeUnit.MINUTES,
-    )
-
-    private val client = HttpClient(Jetty) {
+    private val client = HttpClient(Java) {
 
         install(HttpTimeout) {
-            requestTimeoutMillis = 13_000L
-            connectTimeoutMillis = 5_000L
-            socketTimeoutMillis = 30_000L
+            requestTimeoutMillis = 20_000L
         }
 
         engine {
@@ -101,12 +86,6 @@ class PaymentExternalSystemAdapterImpl(
             dispatcher=dispatcherClient
         }
     }
-
-    private val databaseThreadPool = ScheduledThreadPoolExecutor(
-        20,
-        NamedThreadFactory("payment-submission-executor"),
-        CallerBlockingRejectedExecutionHandler()
-    )
 
     private val semaphore = Semaphore(permits = parallelRequests)
 
@@ -124,7 +103,7 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
+        CoroutineScope(dispatcherPayment + SupervisorJob()).launch {
             bankPayment(transactionId, paymentId, amount, paymentStartedAt)
         }
     }
@@ -140,17 +119,29 @@ class PaymentExternalSystemAdapterImpl(
         url: String,
         paymentStartedAt: Long,
     ) {
-        sendRequest(transactionId, paymentId, url)
+
+        val delayMs = 3000L
+        val maxRetries = 3
+        var curRetry = 1
+
+        while (curRetry < maxRetries) {
+            if (sendRequest(transactionId, paymentId, url, paymentStartedAt)) {
+                return
+            }
+            delay(delayMs)
+            curRetry += 1
+        }
     }
 
     suspend fun sendRequest(
         transactionId: UUID,
         paymentId: UUID,
         url: String,
+        paymentStartedAt: Long
     ): Boolean {
         semaphore.withPermit {
+            rate_limiter.tick()
             sent_to_bank.increment()
-            val startTime = now()
 
             try {
                 val response = client.post(url) { setBody("") }
@@ -160,12 +151,14 @@ class PaymentExternalSystemAdapterImpl(
                     transactionId,
                     paymentId
                 )
+                requestLatency.record((now() - paymentStartedAt).toDouble())
                 return success
             } catch (e: Exception) {
                 when (e) {
                     is SocketTimeoutException -> handleTimeout(transactionId, paymentId, e)
                     else -> handleError(transactionId, paymentId, e)
                 }
+                requestLatency.record((now() - paymentStartedAt).toDouble())
                 return false
             }
         }

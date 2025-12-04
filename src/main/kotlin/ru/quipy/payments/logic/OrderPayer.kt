@@ -29,20 +29,20 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        50,
-        50,
+        10,
+        10,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(500_000),
+        LinkedBlockingQueue(5_000),
         NamedThreadFactory("payment-submission-executor"),
         ThreadPoolExecutor.DiscardOldestPolicy()
     )
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
-//        if (paymentExecutor.queue.size > 500_000) {
-//            return -1
-//        }
+        if (paymentExecutor.queue.size > 4500) {
+            return -1
+        }
         paymentExecutor.submit {
             val createdEvent = paymentESService.create {
                 it.create(
