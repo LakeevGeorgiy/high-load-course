@@ -39,7 +39,7 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
     private val rate_limiter = SlidingWindowRateLimiter(rateLimitPerSec * 1L, Duration.ofMillis(1000))
     private val bulkhead = Bulkhead.of("http-client", BulkheadConfig.custom()
-        .maxConcurrentCalls(5)
+        .maxConcurrentCalls(parallelRequests)
         .maxWaitDuration(Duration.ofMillis(60_000))
         .build())
 
