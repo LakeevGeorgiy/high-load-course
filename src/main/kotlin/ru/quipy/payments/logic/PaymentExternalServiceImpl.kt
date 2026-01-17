@@ -140,7 +140,7 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long
     ): Boolean {
         semaphore.withPermit {
-            rate_limiter.tick()
+            rate_limiter.tickBlocking()
             sent_to_bank.increment()
 
             try {
