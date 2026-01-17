@@ -36,16 +36,8 @@ class APIController {
 
     data class User(val id: UUID, val name: String)
 
-    private val rateLimiter =
-            TokenBucketRateLimiter(
-                rate = 100,
-                bucketMaxCapacity = 275,
-                window = 1,
-                timeUnit = TimeUnit.SECONDS
-            )
-
     fun dropRequest(): ResponseEntity<PaymentSubmissionDto> {
-        val now = System.currentTimeMillis() + 700
+        val now = System.currentTimeMillis() + 5_000
         return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).header("Retry-After", now.toString()).build()
     }
 
@@ -83,9 +75,6 @@ class APIController {
             it
         } ?: throw IllegalArgumentException("No such order $orderId")
 
-        if (!rateLimiter.tick()) {
-            return dropRequest()
-        }
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
         if (createdAt == -1L) {
             return dropRequest()
