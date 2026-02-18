@@ -72,13 +72,13 @@ class PaymentExternalSystemAdapterImpl(
         .publishPercentiles( 0.9, 0.99, 0.999, 0.9999)
         .register(metricRegistry)
 
-    private val dispatcherClient = Executors.newFixedThreadPool(30).asCoroutineDispatcher()
-    private val dispatcherPayment = Executors.newFixedThreadPool(30).asCoroutineDispatcher()
+    private val dispatcherClient = Executors.newFixedThreadPool(40).asCoroutineDispatcher()
+    private val dispatcherPayment = Executors.newFixedThreadPool(40).asCoroutineDispatcher()
 
     private val client = HttpClient(Java) {
 
         install(HttpTimeout) {
-            requestTimeoutMillis = 20_000L
+            requestTimeoutMillis = 1000L
         }
 
         engine {
@@ -120,11 +120,14 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long,
     ) {
 
-        val delayMs = 3000L
+        val delayMs = 100L
         val maxRetries = 3
         var curRetry = 1
 
         while (curRetry < maxRetries) {
+//            if (now() - paymentStartedAt > 700) {
+//                handleTimeout(transactionId, paymentId, Exception("No time to execute"))
+//            }
             if (sendRequest(transactionId, paymentId, url, paymentStartedAt)) {
                 return
             }
