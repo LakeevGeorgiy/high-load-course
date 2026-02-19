@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.github.resilience4j.bulkhead.Bulkhead
 import io.github.resilience4j.bulkhead.BulkheadConfig
+import io.github.resilience4j.kotlin.ratelimiter.executeSuspendFunction
+import io.github.resilience4j.ratelimiter.RateLimiter
+import io.github.resilience4j.ratelimiter.RateLimiterConfig
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.engine.java.Java
@@ -56,7 +59,11 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val rate_limiter = SlidingWindowRateLimiter(rateLimitPerSec * 1L, Duration.ofMillis(1000))
+    private val rateLimiter = RateLimiter.of("rate-limiter", RateLimiterConfig.custom()
+        .limitForPeriod(rateLimitPerSec)
+        .limitRefreshPeriod(Duration.ofMillis(1000))
+        .build()
+    )
 
     private val sent_to_bank: Counter = Counter
         .builder("sent_request_to_bank")
@@ -72,13 +79,13 @@ class PaymentExternalSystemAdapterImpl(
         .publishPercentiles( 0.9, 0.99, 0.999, 0.9999)
         .register(metricRegistry)
 
-    private val dispatcherClient = Executors.newFixedThreadPool(30).asCoroutineDispatcher()
-    private val dispatcherPayment = Executors.newFixedThreadPool(30).asCoroutineDispatcher()
+    private val dispatcherClient = Executors.newFixedThreadPool(60).asCoroutineDispatcher()
+    private val dispatcherPayment = Executors.newFixedThreadPool(60).asCoroutineDispatcher()
 
     private val client = HttpClient(Java) {
 
         install(HttpTimeout) {
-            requestTimeoutMillis = 20_000L
+            requestTimeoutMillis = 1000L
         }
 
         engine {
@@ -120,7 +127,7 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long,
     ) {
 
-        val delayMs = 3000L
+        val delayMs = 100L
         val maxRetries = 3
         var curRetry = 1
 
@@ -139,29 +146,33 @@ class PaymentExternalSystemAdapterImpl(
         url: String,
         paymentStartedAt: Long
     ): Boolean {
+        var result = false
         semaphore.withPermit {
-            rate_limiter.tickBlocking()
-            sent_to_bank.increment()
+            rateLimiter.executeSuspendFunction {
 
-            try {
-                val response = client.post(url) { setBody("") }
-                val success = handleSuccess(
-                    response.status.value,
-                    response.bodyAsText(),
-                    transactionId,
-                    paymentId
-                )
-                requestLatency.record((now() - paymentStartedAt).toDouble())
-                return success
-            } catch (e: Exception) {
-                when (e) {
-                    is SocketTimeoutException -> handleTimeout(transactionId, paymentId, e)
-                    else -> handleError(transactionId, paymentId, e)
+                sent_to_bank.increment()
+
+                try {
+                    val response = client.post(url) { setBody("") }
+                    val success = handleSuccess(
+                        response.status.value,
+                        response.bodyAsText(),
+                        transactionId,
+                        paymentId
+                    )
+                    requestLatency.record((now() - paymentStartedAt).toDouble())
+                    result = success
+                } catch (e: Exception) {
+                    when (e) {
+                        is SocketTimeoutException -> handleTimeout(transactionId, paymentId, e)
+                        else -> handleError(transactionId, paymentId, e)
+                    }
+                    requestLatency.record((now() - paymentStartedAt).toDouble())
+                    result = false
                 }
-                requestLatency.record((now() - paymentStartedAt).toDouble())
-                return false
             }
         }
+        return result
     }
 
     private fun handleTimeout(transactionId: UUID, paymentId: UUID, e: Exception) {
