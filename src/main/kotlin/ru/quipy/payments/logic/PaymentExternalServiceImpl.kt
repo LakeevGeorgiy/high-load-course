@@ -2,25 +2,21 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import io.github.resilience4j.bulkhead.Bulkhead
-import io.github.resilience4j.bulkhead.BulkheadConfig
 import io.github.resilience4j.kotlin.ratelimiter.executeSuspendFunction
 import io.github.resilience4j.ratelimiter.RateLimiter
 import io.github.resilience4j.ratelimiter.RateLimiterConfig
 import io.ktor.client.HttpClient
-import io.ktor.client.engine.cio.CIO
 import io.ktor.client.engine.java.Java
-import io.ktor.client.engine.jetty.jakarta.Jetty
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
-import io.ktor.websocket.WebSocketDeflateExtension.Companion.install
+import io.ktor.http.headers
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.DistributionSummary
 import io.micrometer.core.instrument.MeterRegistry
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.coroutineScope
@@ -28,16 +24,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
-import okhttp3.ConnectionPool
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -70,8 +65,12 @@ class PaymentExternalSystemAdapterImpl(
         .tags("account_name", accountName)
         .register(metricRegistry)
 
-    private val repeat_request: Counter = Counter
+    private val repeatRequest: Counter = Counter
         .builder("repeat_request")
+        .register(metricRegistry)
+
+    private val hedgedRequest: Counter = Counter
+        .builder("hedged_request")
         .register(metricRegistry)
 
     var requestLatency: DistributionSummary = DistributionSummary
@@ -85,7 +84,7 @@ class PaymentExternalSystemAdapterImpl(
     private val client = HttpClient(Java) {
 
         install(HttpTimeout) {
-            requestTimeoutMillis = 1000L
+            requestTimeoutMillis = 1500L
         }
 
         engine {
@@ -127,12 +126,15 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long,
     ) {
 
-        val delayMs = 100L
-        val maxRetries = 3
+        val delayMs = 0L
+        val maxRetries = 2
         var curRetry = 1
 
         while (curRetry < maxRetries) {
-            if (sendRequest(transactionId, paymentId, url, paymentStartedAt)) {
+            if (curRetry > 1) {
+                repeatRequest.increment()
+            }
+            if (sendRequestWithLimiting(transactionId, paymentId, url, paymentStartedAt)) {
                 return
             }
             delay(delayMs)
@@ -140,38 +142,100 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    suspend fun sendRequest(
+    suspend fun sendRequestWithLimiting(
         transactionId: UUID,
         paymentId: UUID,
         url: String,
-        paymentStartedAt: Long
+        paymentStartedAt: Long,
     ): Boolean {
-        var result = false
+        var result = true
         semaphore.withPermit {
             rateLimiter.executeSuspendFunction {
 
                 sent_to_bank.increment()
+                result = sendHedgedRequest(transactionId, paymentId, url, paymentStartedAt)
 
-                try {
-                    val response = client.post(url) { setBody("") }
-                    val success = handleSuccess(
-                        response.status.value,
-                        response.bodyAsText(),
-                        transactionId,
-                        paymentId
-                    )
-                    requestLatency.record((now() - paymentStartedAt).toDouble())
-                    result = success
-                } catch (e: Exception) {
-                    when (e) {
-                        is SocketTimeoutException -> handleTimeout(transactionId, paymentId, e)
-                        else -> handleError(transactionId, paymentId, e)
-                    }
-                    requestLatency.record((now() - paymentStartedAt).toDouble())
-                    result = false
-                }
             }
         }
+        return result
+    }
+
+    suspend fun sendHedgedRequest(
+        transactionId: UUID,
+        paymentId: UUID,
+        url: String,
+        paymentStartedAt: Long,
+    ): Boolean {
+
+        val idempotencyKey = UUID.randomUUID().toString()
+        val requestJob = SupervisorJob()
+        var result = AtomicBoolean(false)
+        val completed = AtomicBoolean(false)
+        val responseReceived = CompletableDeferred<Boolean>()
+
+        coroutineScope {
+            val primaryJob = launch(requestJob) {
+                val ok = sendRequest(transactionId, paymentId, url, paymentStartedAt, idempotencyKey)
+                if (ok) {
+                    result.compareAndSet(false, true)
+                }
+                if (completed.compareAndSet(false, true)) {
+                    responseReceived.complete(true)
+                }
+            }
+
+            val hedgedJob = launch(requestJob) {
+                delay(300)
+                if (!completed.get()){
+                    hedgedRequest.increment()
+                    val ok = sendRequest(transactionId, paymentId, url, paymentStartedAt, idempotencyKey)
+                    if (ok) {
+                        result.compareAndSet(false, true)
+                    }
+                    if (completed.compareAndSet(false, true)) {
+                        responseReceived.complete(true)
+                    }
+                }
+            }
+
+            val allJobs = listOf(primaryJob) + hedgedJob
+            if (completed.get()) {
+                allJobs.forEach { it.cancel() }
+            }
+        }
+        return result.get()
+    }
+
+    private suspend fun sendRequest(
+        transactionId: UUID,
+        paymentId: UUID,
+        url: String,
+        paymentStartedAt: Long,
+        idempotencyKey: String
+    ): Boolean {
+        var result = false
+        try {
+            val response = client.post(url) {
+                setBody("")
+                headers {
+                    append("x-idempotency-key", idempotencyKey)
+                }
+            }
+            val success = handleSuccess(
+                response.status.value,
+                response.bodyAsText(),
+                transactionId,
+                paymentId
+            )
+            result = success
+        } catch (e: Exception) {
+            when (e) {
+                is SocketTimeoutException -> handleTimeout(transactionId, paymentId, e)
+                else -> handleError(transactionId, paymentId, e)
+            }
+            result = false
+        }
+        requestLatency.record((now() - paymentStartedAt).toDouble())
         return result
     }
 
