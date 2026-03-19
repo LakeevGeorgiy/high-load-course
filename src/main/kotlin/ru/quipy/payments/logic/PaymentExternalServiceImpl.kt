@@ -2,10 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import io.github.resilience4j.circuitbreaker.CallNotPermittedException
 import io.github.resilience4j.circuitbreaker.CircuitBreaker
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
-import io.github.resilience4j.kotlin.circuitbreaker.executeSuspendFunction
 import io.github.resilience4j.kotlin.ratelimiter.executeSuspendFunction
 import io.github.resilience4j.ratelimiter.RateLimiter
 import io.github.resilience4j.ratelimiter.RateLimiterConfig
@@ -19,16 +17,10 @@ import io.ktor.http.headers
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.DistributionSummary
 import io.micrometer.core.instrument.MeterRegistry
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.consumeAsFlow
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -39,12 +31,10 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.coroutines.cancellation.CancellationException
-import kotlin.math.log
 
 class PaymentDto(
     val paymentId: UUID,
@@ -100,14 +90,15 @@ class PaymentExternalSystemAdapterImpl(
         .register(metricRegistry)
 
     private var circuitBreakerConfig = CircuitBreakerConfig.custom()
-        .failureRateThreshold(50f)
-        .slowCallRateThreshold(50f)
-        .slowCallDurationThreshold(Duration.ofMillis(1500))
-        .waitDurationInOpenState(Duration.ofMillis(5_000))
-        .maxWaitDurationInHalfOpenState(Duration.ofMillis(5_000))
-        .permittedNumberOfCallsInHalfOpenState(rateLimitPerSec / 10)
         .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.TIME_BASED)
-        .slidingWindowSize(300)
+        .slidingWindowSize(10)
+        .minimumNumberOfCalls(20)
+        .failureRateThreshold(70f)
+        .slowCallRateThreshold(80f)
+        .slowCallDurationThreshold(Duration.ofMillis(800))
+        .waitDurationInOpenState(Duration.ofSeconds(1))
+        .permittedNumberOfCallsInHalfOpenState(5)
+        .automaticTransitionFromOpenToHalfOpenEnabled(true)
         .build()
 
     private val circuitBreaker = CircuitBreaker.of("circuit-breaker", circuitBreakerConfig)
@@ -115,8 +106,7 @@ class PaymentExternalSystemAdapterImpl(
         .builder("circuit-status")
         .register(metricRegistry)
 
-    private val paymentQueue = Collections.synchronizedList(mutableListOf<PaymentDto>())
-    private val paymentChannel = Channel<PaymentDto>(Channel.UNLIMITED)
+    private val paymentQueue = ConcurrentLinkedQueue<PaymentDto>()
     private val channelSize = AtomicInteger(0)
 
 
@@ -137,29 +127,6 @@ class PaymentExternalSystemAdapterImpl(
 
     private val semaphore = Semaphore(permits = parallelRequests)
 
-    init {
-        processQueue()
-    }
-
-    private fun processQueue() {
-        CoroutineScope(dispatcherPayment + SupervisorJob()).launch {
-            paymentChannel.consumeAsFlow()
-                .onEach { payment ->
-                    val success = performPayment(payment)
-                    if (!success) {
-                        paymentChannel.send(payment)
-                    } else {
-                        channelSize.decrementAndGet()
-                    }
-
-                    val curSize = channelSize.get()
-                    logger.error("Channel size: $curSize")
-                }
-                .launchIn(this)
-        }
-    }
-
-
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
@@ -174,42 +141,9 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         val paymentDto = PaymentDto(paymentId, transactionId, amount, paymentStartedAt, deadline)
-
         CoroutineScope(dispatcherPayment + SupervisorJob()).launch {
-            val result = performPayment(paymentDto)
-            if (!result) {
-                channelSize.incrementAndGet()
-                paymentChannel.send(paymentDto)
-            }
+            bankPayment(paymentDto)
         }
-    }
-
-    private suspend fun performPayment(paymentDto: PaymentDto): Boolean {
-        var result = false
-        when (circuitBreaker.state) {
-            CircuitBreaker.State.OPEN -> {
-                paymentChannel.send(paymentDto)
-                logger.error("Open - timeout: ${circuitBreaker.metrics.slowCallRate} failures: ${circuitBreaker.metrics.failureRate}")
-            }
-
-            CircuitBreaker.State.HALF_OPEN -> {
-                if (!circuitBreaker.tryAcquirePermission()) {
-                    paymentChannel.send(paymentDto)
-                } else {
-                    result = bankPayment(paymentDto)
-                }
-            }
-
-            CircuitBreaker.State.CLOSED -> {
-                delay(1000)
-                result = bankPayment(paymentDto)
-            }
-
-            else -> {
-                logger.error("Strange state in circuit breaker: ${circuitBreaker.state}")
-            }
-        }
-        return result
     }
 
     private suspend fun bankPayment(paymentDto: PaymentDto): Boolean {
@@ -224,18 +158,18 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long,
     ): Boolean {
 
-        val delayMs = 3000L
-        val maxRetries = 3
+        val delayMs = 10L
+        val maxRetries = 100
         var curRetry = 1
 
         while (curRetry <= maxRetries) {
             if (curRetry > 1) {
                 repeatRequest.increment()
             }
-            if (sendHedgedRequest(transactionId, paymentId, url, paymentStartedAt)) {
+            if (sendRequestWithLimiting(transactionId, paymentId, url, paymentStartedAt, "")) {
                 return true
             }
-            delay(delayMs)
+            delay(delayMs * curRetry)
             curRetry += 1
         }
         return false
@@ -253,57 +187,14 @@ class PaymentExternalSystemAdapterImpl(
             rateLimiter.executeSuspendFunction {
 
                 sent_to_bank.increment()
+                while (!circuitBreaker.tryAcquirePermission()) {
+                    delay(10)
+                }
                 result = sendRequest(transactionId, paymentId, url, idempotencyKey)
 
             }
         }
         return result
-    }
-
-    suspend fun sendHedgedRequest(
-        transactionId: UUID,
-        paymentId: UUID,
-        url: String,
-        paymentStartedAt: Long,
-    ): Boolean {
-
-        val idempotencyKey = UUID.randomUUID().toString()
-        val requestJob = SupervisorJob()
-        var result = AtomicBoolean(false)
-        val completed = AtomicBoolean(false)
-        val responseReceived = CompletableDeferred<Boolean>()
-
-        coroutineScope {
-            val primaryJob = launch(requestJob) {
-                val ok = sendRequestWithLimiting(transactionId, paymentId, url, paymentStartedAt, idempotencyKey)
-                if (ok) {
-                    result.compareAndSet(false, true)
-                }
-                if (completed.compareAndSet(false, true)) {
-                    responseReceived.complete(true)
-                }
-            }
-
-            val hedgedJob = launch(requestJob) {
-                delay(90)
-                if (!completed.get()){
-                    hedgedRequest.increment()
-                    val ok = sendRequestWithLimiting(transactionId, paymentId, url, paymentStartedAt, idempotencyKey)
-                    if (ok) {
-                        result.compareAndSet(false, true)
-                    }
-                    if (completed.compareAndSet(false, true)) {
-                        responseReceived.complete(true)
-                    }
-                }
-            }
-
-            val allJobs = listOf(primaryJob) + hedgedJob
-            if (completed.get()) {
-                allJobs.forEach { it.cancel() }
-            }
-        }
-        return result.get()
     }
 
     private suspend fun sendRequest(
@@ -317,9 +208,6 @@ class PaymentExternalSystemAdapterImpl(
         try {
             val response = client.post(url) {
                 setBody("")
-                headers {
-                    append("x-idempotency-key", idempotencyKey)
-                }
             }
             result = handleSuccess(
                 response.status.value,
@@ -362,6 +250,8 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     fun handleSuccess(responseCode: Int, responseBody: String, transactionId: UUID, paymentId: UUID, paymentStartedAt: Long): Boolean {
+        var result = true
+
         val body = try {
             mapper.readValue(responseBody, ExternalSysResponse::class.java)
         } catch (e: Exception) {
