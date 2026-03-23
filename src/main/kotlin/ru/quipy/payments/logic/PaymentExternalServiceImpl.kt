@@ -104,7 +104,7 @@ class PaymentExternalSystemAdapterImpl(
         .slowCallDurationThreshold(Duration.ofMillis(800))
 
         // Переход из открытой цепочки в полуоткрытую
-        .waitDurationInOpenState(Duration.ofSeconds(15))
+        .waitDurationInOpenState(Duration.ofSeconds(30))
         // Переход из полуоткрытой в закрытую цепочку
         .permittedNumberOfCallsInHalfOpenState(150)
         .automaticTransitionFromOpenToHalfOpenEnabled(true)
