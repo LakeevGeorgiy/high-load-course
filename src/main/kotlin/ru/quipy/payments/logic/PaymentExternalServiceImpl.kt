@@ -2,8 +2,10 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException
 import io.github.resilience4j.circuitbreaker.CircuitBreaker
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
+import io.github.resilience4j.kotlin.circuitbreaker.executeSuspendFunction
 import io.github.resilience4j.kotlin.ratelimiter.executeSuspendFunction
 import io.github.resilience4j.ratelimiter.RateLimiter
 import io.github.resilience4j.ratelimiter.RateLimiterConfig
@@ -90,15 +92,23 @@ class PaymentExternalSystemAdapterImpl(
         .register(metricRegistry)
 
     private var circuitBreakerConfig = CircuitBreakerConfig.custom()
-        .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.TIME_BASED)
-        .slidingWindowSize(10)
-        .minimumNumberOfCalls(20)
-        .failureRateThreshold(70f)
-        .slowCallRateThreshold(80f)
+        // Окно, которым считаем успехи и неуспехи
+        .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+        .slidingWindowSize(100)
+        .minimumNumberOfCalls(50)
+
+        // Если упало 10% запросов или 10% были медленными,
+        // то открываем цепочку
+        .failureRateThreshold(10f)
+        .slowCallRateThreshold(10f)
         .slowCallDurationThreshold(Duration.ofMillis(800))
-        .waitDurationInOpenState(Duration.ofSeconds(1))
-        .permittedNumberOfCallsInHalfOpenState(5)
+
+        // Переход из открытой цепочки в полуоткрытую
+        .waitDurationInOpenState(Duration.ofSeconds(15))
+        // Переход из полуоткрытой в закрытую цепочку
+        .permittedNumberOfCallsInHalfOpenState(150)
         .automaticTransitionFromOpenToHalfOpenEnabled(true)
+        .recordExceptions(Exception::class.java, CallNotPermittedException::class.java)
         .build()
 
     private val circuitBreaker = CircuitBreaker.of("circuit-breaker", circuitBreakerConfig)
@@ -110,8 +120,8 @@ class PaymentExternalSystemAdapterImpl(
     private val channelSize = AtomicInteger(0)
 
 
-    private val dispatcherClient = Executors.newFixedThreadPool(60).asCoroutineDispatcher()
-    private val dispatcherPayment = Executors.newFixedThreadPool(60).asCoroutineDispatcher()
+    private val dispatcherClient = Executors.newFixedThreadPool(20).asCoroutineDispatcher()
+    private val dispatcherPayment = Executors.newFixedThreadPool(20).asCoroutineDispatcher()
 
     private val client = HttpClient(Java) {
 
@@ -158,8 +168,8 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long,
     ): Boolean {
 
-        val delayMs = 10L
-        val maxRetries = 100
+        val delayMs = 100L
+        val maxRetries = 10
         var curRetry = 1
 
         while (curRetry <= maxRetries) {
@@ -172,6 +182,7 @@ class PaymentExternalSystemAdapterImpl(
             delay(delayMs * curRetry)
             curRetry += 1
         }
+        logger.error("Not successful request")
         return false
     }
 
@@ -183,16 +194,24 @@ class PaymentExternalSystemAdapterImpl(
         idempotencyKey: String
     ): Boolean {
         var result = true
-        semaphore.withPermit {
-            rateLimiter.executeSuspendFunction {
+        try {
+            semaphore.withPermit {
+                rateLimiter.executeSuspendFunction {
 
-                sent_to_bank.increment()
-                while (!circuitBreaker.tryAcquirePermission()) {
-                    delay(10)
+                    sent_to_bank.increment()
+                    circuitBreaker.executeSuspendFunction {
+                        result = sendRequest(transactionId, paymentId, url, idempotencyKey)
+                    }
+
                 }
-                result = sendRequest(transactionId, paymentId, url, idempotencyKey)
-
             }
+        } catch (e: CallNotPermittedException) {
+            logger.error("Call not permitted")
+//            delay(500)
+            result = false
+        } catch (e: Exception) {
+//            logger.error("Exception while sending request")
+            result = false
         }
         return result
     }
@@ -216,6 +235,8 @@ class PaymentExternalSystemAdapterImpl(
                 paymentId,
                 paymentStartedAt
             )
+//            requestLatency.record((now() - paymentStartedAt).toDouble())
+//            return result
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> handleTimeout(transactionId, paymentId, e)
@@ -226,11 +247,8 @@ class PaymentExternalSystemAdapterImpl(
 
         val paymentDuration = now() - paymentStartedAt
         requestLatency.record(paymentDuration.toDouble())
-
-        if (result) {
-            circuitBreaker.onSuccess(paymentDuration, TimeUnit.MILLISECONDS)
-        } else {
-            circuitBreaker.onError(paymentDuration, TimeUnit.MILLISECONDS, Exception())
+        if (!result) {
+            throw Exception()
         }
         return result
     }
@@ -250,7 +268,6 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     fun handleSuccess(responseCode: Int, responseBody: String, transactionId: UUID, paymentId: UUID, paymentStartedAt: Long): Boolean {
-        var result = true
 
         val body = try {
             mapper.readValue(responseBody, ExternalSysResponse::class.java)
