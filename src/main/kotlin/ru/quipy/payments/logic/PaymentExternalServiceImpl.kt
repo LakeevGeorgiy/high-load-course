@@ -32,10 +32,12 @@ import org.slf4j.LoggerFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
+import java.net.http.HttpRequest
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -94,31 +96,25 @@ class PaymentExternalSystemAdapterImpl(
 
     private var circuitBreakerConfig = CircuitBreakerConfig.custom()
         // Окно, которым считаем успехи и неуспехи
-        .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.TIME_BASED)
-        .slidingWindowSize(10)
-        .minimumNumberOfCalls(20)
+        .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+        .slidingWindowSize(100)
+        .minimumNumberOfCalls(50)
 
         // Если упало 10% запросов или 10% были медленными,
         // то открываем цепочку
-        .failureRateThreshold(50f)
-        .slowCallRateThreshold(50f)
+        .failureRateThreshold(8f)
+        .slowCallRateThreshold(8f)
         .slowCallDurationThreshold(Duration.ofMillis(800))
 
         // Переход из открытой цепочки в полуоткрытую
-        .waitDurationInOpenState(Duration.ofMillis(1000))
+        .waitDurationInOpenState(Duration.ofSeconds(15))
         // Переход из полуоткрытой в закрытую цепочку
-        .permittedNumberOfCallsInHalfOpenState(5)
+        .permittedNumberOfCallsInHalfOpenState(150)
         .automaticTransitionFromOpenToHalfOpenEnabled(true)
         .recordExceptions(Exception::class.java, HttpRequestTimeoutException::class.java)
         .build()
 
     private val circuitBreaker = CircuitBreaker.of("circuit-breaker", circuitBreakerConfig)
-    private var circuitStatus: Counter = Counter
-        .builder("circuit-status")
-        .register(metricRegistry)
-
-    private val paymentQueue = ConcurrentLinkedQueue<PaymentDto>()
-    private val channelSize = AtomicInteger(0)
 
 
     private val dispatcherClient = Executors.newFixedThreadPool(20).asCoroutineDispatcher()
@@ -128,8 +124,7 @@ class PaymentExternalSystemAdapterImpl(
     private val client = HttpClient(Java) {
 
         install(HttpTimeout) {
-            connectTimeoutMillis = 5000L
-//            requestTimeoutMillis = 5000L
+            requestTimeoutMillis = 150000L
         }
 
         engine {
@@ -159,38 +154,47 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    private suspend fun bankPayment(paymentDto: PaymentDto): Boolean {
+    private suspend fun bankPayment(paymentDto: PaymentDto) {
         val urlString = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=${paymentDto.transactionId}&paymentId=${paymentDto.paymentId}&amount=${paymentDto.amount}"
-        return sendRequestWithRetry(paymentDto, urlString)
+        sendRequestWithRetry(paymentDto, urlString)
+    }
+
+    private fun calculateRetryDelay(retryCount: Int): Long {
+        val expBackoff = (1L shl (retryCount - 1).coerceAtMost(7)) * 5L
+        val jitter = ThreadLocalRandom.current().nextLong(0, 15)
+        return (expBackoff + jitter).coerceAtMost(500L)
     }
 
     private suspend fun sendRequestWithRetry(
         paymentDto: PaymentDto,
         url: String,
-    ): Boolean {
+    ) {
 
-        val delayMs = 100L
-        val maxRetries = 10
+        val maxRetries = 6
         var curRetry = 1
 
-        while (now() - paymentDto.paymentStartedAt <= clientTimeout) {
-            if (curRetry > 1) {
-                repeatRequest.increment()
-            }
+        while (curRetry <= maxRetries) {
             if (sendRequestWithLimiting(paymentDto, url, "")) {
                 paymentESService.update(paymentDto.paymentId) {
                     it.logProcessing(true, now(), paymentDto.transactionId, reason = "success")
                 }
-                return true
+                return
             }
-            delay(delayMs * curRetry)
+            if (now() - paymentDto.paymentStartedAt >= clientTimeout) {
+                paymentESService.update(paymentDto.paymentId) {
+                    it.logProcessing(false, now(), paymentDto.transactionId, reason = "timeout")
+                }
+                return
+            }
+            delay(calculateRetryDelay(curRetry))
             curRetry += 1
+            repeatRequest.increment()
         }
+
         logger.error("Not successful request")
         paymentESService.update(paymentDto.paymentId) {
             it.logProcessing(false, now(), paymentDto.transactionId, reason = "error")
         }
-        return false
     }
 
     suspend fun sendRequestWithLimiting(
@@ -204,17 +208,24 @@ class PaymentExternalSystemAdapterImpl(
                 rateLimiter.executeSuspendFunction {
 
                     sent_to_bank.increment()
-                    circuitBreaker.executeSuspendFunction {
-                        result = sendRequest(paymentDto, url, idempotencyKey)
+                    if (!circuitBreaker.tryAcquirePermission()) {
+                        paymentESService.update(paymentDto.paymentId) {
+                            it.logProcessing(false, now(), paymentDto.transactionId, reason = "timeout")
+                        }
+                        return@executeSuspendFunction false
                     }
+
+//                    circuitBreaker.executeSuspendFunction {
+                        return@executeSuspendFunction sendRequest(paymentDto, url, idempotencyKey)
+//                    }
 
                 }
             }
         } catch (e: CallNotPermittedException) {
-            paymentESService.update(paymentDto.paymentId) {
-                it.logProcessing(false, now(), paymentDto.transactionId, reason = "OPEN")
-            }
-            result = false
+//            paymentESService.update(paymentDto.paymentId) {
+//                it.logProcessing(false, now(), paymentDto.transactionId, reason = "OPEN")
+//            }
+            return false
         } catch (e: Exception) {
 //            logger.error("Exception while sending request")
             result = false
@@ -227,58 +238,51 @@ class PaymentExternalSystemAdapterImpl(
         url: String,
         idempotencyKey: String
     ): Boolean {
-        var result = false
         try {
             val response = client.post(url) {
                 setBody("")
             }
 
-            result = handleSuccess(
+            return handleSuccess(
                 response.status.value,
                 response.bodyAsText(),
                 paymentDto.transactionId,
                 paymentDto.paymentId,
                 paymentDto.paymentStartedAt
             )
-//            requestLatency.record((now() - paymentStartedAt).toDouble())
-//            return result
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> handleTimeout(paymentDto.transactionId, paymentDto.paymentId, e)
                 else -> handleError(paymentDto.transactionId, paymentDto.paymentId, e)
             }
-            result = false
         }
 
         val paymentDuration = now() - paymentDto.paymentStartedAt
         requestLatency.record(paymentDuration.toDouble())
-        if (!result) {
-            throw Exception()
-        }
-        return result
+//        throw Exception()
+        circuitBreaker.onError(paymentDuration, TimeUnit.MILLISECONDS, Exception())
+        return false
     }
 
     private fun handleTimeout(transactionId: UUID, paymentId: UUID, e: Exception) {
         logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-//        paymentESService.update(paymentId) {
-//            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-//        }
     }
 
     private fun handleError(transactionId: UUID, paymentId: UUID, e: Exception) {
         logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-//        paymentESService.update(paymentId) {
-//            it.logProcessing(false, now(), transactionId, reason = e.message)
-//        }
     }
 
     fun handleSuccess(responseCode: Int, responseBody: String, transactionId: UUID, paymentId: UUID, paymentStartedAt: Long): Boolean {
 
+        val paymentDuration = now() - paymentStartedAt
         if (responseCode != 200) {
+            circuitBreaker.onError(paymentDuration, TimeUnit.MILLISECONDS, Exception())
+
             return false
         }
 
         if (responseBody.isBlank()) {
+            circuitBreaker.onError(paymentDuration, TimeUnit.MILLISECONDS, Exception())
             return false
         }
 
@@ -289,9 +293,8 @@ class PaymentExternalSystemAdapterImpl(
             ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
         }
 
-        if (!body.result) {
-            return false
-        }
+        circuitBreaker.onSuccess(paymentDuration, TimeUnit.MILLISECONDS)
+
 
         logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body?.message}")
 
