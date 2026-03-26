@@ -11,6 +11,7 @@ import io.github.resilience4j.ratelimiter.RateLimiter
 import io.github.resilience4j.ratelimiter.RateLimiterConfig
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.java.Java
+import io.ktor.client.plugins.HttpRequestTimeoutException
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
@@ -69,7 +70,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = RateLimiter.of("rate-limiter", RateLimiterConfig.custom()
         .limitForPeriod(rateLimitPerSec)
         .limitRefreshPeriod(Duration.ofMillis(1000))
-        .timeoutDuration(Duration.ofSeconds(100))
+        .timeoutDuration(Duration.ofSeconds(10_000))
         .build()
     )
 
@@ -99,16 +100,16 @@ class PaymentExternalSystemAdapterImpl(
 
         // Если упало 10% запросов или 10% были медленными,
         // то открываем цепочку
-        .failureRateThreshold(10f)
-        .slowCallRateThreshold(10f)
+        .failureRateThreshold(50f)
+        .slowCallRateThreshold(50f)
         .slowCallDurationThreshold(Duration.ofMillis(800))
 
         // Переход из открытой цепочки в полуоткрытую
-        .waitDurationInOpenState(Duration.ofSeconds(30))
+        .waitDurationInOpenState(Duration.ofMillis(1000))
         // Переход из полуоткрытой в закрытую цепочку
-        .permittedNumberOfCallsInHalfOpenState(150)
+        .permittedNumberOfCallsInHalfOpenState(5)
         .automaticTransitionFromOpenToHalfOpenEnabled(true)
-        .recordExceptions(Exception::class.java, CallNotPermittedException::class.java)
+        .recordExceptions(Exception::class.java, HttpRequestTimeoutException::class.java)
         .build()
 
     private val circuitBreaker = CircuitBreaker.of("circuit-breaker", circuitBreakerConfig)
@@ -126,7 +127,7 @@ class PaymentExternalSystemAdapterImpl(
     private val client = HttpClient(Java) {
 
         install(HttpTimeout) {
-            requestTimeoutMillis = 150000L
+            requestTimeoutMillis = 5000L
         }
 
         engine {
@@ -158,14 +159,12 @@ class PaymentExternalSystemAdapterImpl(
 
     private suspend fun bankPayment(paymentDto: PaymentDto): Boolean {
         val urlString = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=${paymentDto.transactionId}&paymentId=${paymentDto.paymentId}&amount=${paymentDto.amount}"
-        return sendRequestWithRetry(paymentDto.transactionId, paymentDto.paymentId, urlString, paymentDto.paymentStartedAt)
+        return sendRequestWithRetry(paymentDto, urlString)
     }
 
     private suspend fun sendRequestWithRetry(
-        transactionId: UUID,
-        paymentId: UUID,
+        paymentDto: PaymentDto,
         url: String,
-        paymentStartedAt: Long,
     ): Boolean {
 
         val delayMs = 100L
@@ -176,7 +175,7 @@ class PaymentExternalSystemAdapterImpl(
             if (curRetry > 1) {
                 repeatRequest.increment()
             }
-            if (sendRequestWithLimiting(transactionId, paymentId, url, paymentStartedAt, "")) {
+            if (sendRequestWithLimiting(paymentDto, url, "")) {
                 return true
             }
             delay(delayMs * curRetry)
@@ -187,10 +186,8 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     suspend fun sendRequestWithLimiting(
-        transactionId: UUID,
-        paymentId: UUID,
+        paymentDto: PaymentDto,
         url: String,
-        paymentStartedAt: Long,
         idempotencyKey: String
     ): Boolean {
         var result = true
@@ -200,7 +197,7 @@ class PaymentExternalSystemAdapterImpl(
 
                     sent_to_bank.increment()
                     circuitBreaker.executeSuspendFunction {
-                        result = sendRequest(transactionId, paymentId, url, idempotencyKey)
+                        result = sendRequest(paymentDto, url, idempotencyKey)
                     }
 
                 }
@@ -217,13 +214,11 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private suspend fun sendRequest(
-        transactionId: UUID,
-        paymentId: UUID,
+        paymentDto: PaymentDto,
         url: String,
         idempotencyKey: String
     ): Boolean {
         var result = false
-        val paymentStartedAt = now()
         try {
             val response = client.post(url) {
                 setBody("")
@@ -231,21 +226,21 @@ class PaymentExternalSystemAdapterImpl(
             result = handleSuccess(
                 response.status.value,
                 response.bodyAsText(),
-                transactionId,
-                paymentId,
-                paymentStartedAt
+                paymentDto.transactionId,
+                paymentDto.paymentId,
+                paymentDto.paymentStartedAt
             )
 //            requestLatency.record((now() - paymentStartedAt).toDouble())
 //            return result
         } catch (e: Exception) {
             when (e) {
-                is SocketTimeoutException -> handleTimeout(transactionId, paymentId, e)
-                else -> handleError(transactionId, paymentId, e)
+                is SocketTimeoutException -> handleTimeout(paymentDto.transactionId, paymentDto.paymentId, e)
+                else -> handleError(paymentDto.transactionId, paymentDto.paymentId, e)
             }
             result = false
         }
 
-        val paymentDuration = now() - paymentStartedAt
+        val paymentDuration = now() - paymentDto.paymentStartedAt
         requestLatency.record(paymentDuration.toDouble())
         if (!result) {
             throw Exception()
