@@ -211,7 +211,9 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } catch (e: CallNotPermittedException) {
-//            delay(500)
+            paymentESService.update(paymentDto.paymentId) {
+                it.logProcessing(false, now(), paymentDto.transactionId, reason = "OPEN")
+            }
             result = false
         } catch (e: Exception) {
 //            logger.error("Exception while sending request")
