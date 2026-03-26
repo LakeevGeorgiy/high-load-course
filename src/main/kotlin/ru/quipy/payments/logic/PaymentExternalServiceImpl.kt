@@ -94,9 +94,9 @@ class PaymentExternalSystemAdapterImpl(
 
     private var circuitBreakerConfig = CircuitBreakerConfig.custom()
         // Окно, которым считаем успехи и неуспехи
-        .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
-        .slidingWindowSize(100)
-        .minimumNumberOfCalls(50)
+        .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.TIME_BASED)
+        .slidingWindowSize(10)
+        .minimumNumberOfCalls(20)
 
         // Если упало 10% запросов или 10% были медленными,
         // то открываем цепочку
@@ -123,11 +123,13 @@ class PaymentExternalSystemAdapterImpl(
 
     private val dispatcherClient = Executors.newFixedThreadPool(20).asCoroutineDispatcher()
     private val dispatcherPayment = Executors.newFixedThreadPool(20).asCoroutineDispatcher()
+    private val clientTimeout = 10000000L
 
     private val client = HttpClient(Java) {
 
         install(HttpTimeout) {
-            requestTimeoutMillis = 5000L
+            connectTimeoutMillis = 5000L
+//            requestTimeoutMillis = 5000L
         }
 
         engine {
@@ -171,17 +173,23 @@ class PaymentExternalSystemAdapterImpl(
         val maxRetries = 10
         var curRetry = 1
 
-        while (curRetry <= maxRetries) {
+        while (now() - paymentDto.paymentStartedAt <= clientTimeout) {
             if (curRetry > 1) {
                 repeatRequest.increment()
             }
             if (sendRequestWithLimiting(paymentDto, url, "")) {
+                paymentESService.update(paymentDto.paymentId) {
+                    it.logProcessing(true, now(), paymentDto.transactionId, reason = "success")
+                }
                 return true
             }
             delay(delayMs * curRetry)
             curRetry += 1
         }
         logger.error("Not successful request")
+        paymentESService.update(paymentDto.paymentId) {
+            it.logProcessing(false, now(), paymentDto.transactionId, reason = "error")
+        }
         return false
     }
 
@@ -203,7 +211,6 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } catch (e: CallNotPermittedException) {
-            logger.error("Call not permitted")
 //            delay(500)
             result = false
         } catch (e: Exception) {
@@ -223,6 +230,7 @@ class PaymentExternalSystemAdapterImpl(
             val response = client.post(url) {
                 setBody("")
             }
+
             result = handleSuccess(
                 response.status.value,
                 response.bodyAsText(),
@@ -250,19 +258,27 @@ class PaymentExternalSystemAdapterImpl(
 
     private fun handleTimeout(transactionId: UUID, paymentId: UUID, e: Exception) {
         logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-        paymentESService.update(paymentId) {
-            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-        }
+//        paymentESService.update(paymentId) {
+//            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+//        }
     }
 
     private fun handleError(transactionId: UUID, paymentId: UUID, e: Exception) {
         logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-        paymentESService.update(paymentId) {
-            it.logProcessing(false, now(), transactionId, reason = e.message)
-        }
+//        paymentESService.update(paymentId) {
+//            it.logProcessing(false, now(), transactionId, reason = e.message)
+//        }
     }
 
     fun handleSuccess(responseCode: Int, responseBody: String, transactionId: UUID, paymentId: UUID, paymentStartedAt: Long): Boolean {
+
+        if (responseCode != 200) {
+            return false
+        }
+
+        if (responseBody.isBlank()) {
+            return false
+        }
 
         val body = try {
             mapper.readValue(responseBody, ExternalSysResponse::class.java)
@@ -271,13 +287,11 @@ class PaymentExternalSystemAdapterImpl(
             ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
         }
 
-        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body?.message}")
-
-        // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-        // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-        paymentESService.update(paymentId) {
-            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+        if (!body.result) {
+            return false
         }
+
+        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body?.message}")
 
         return body.result
     }
