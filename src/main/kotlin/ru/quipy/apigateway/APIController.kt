@@ -37,7 +37,7 @@ class APIController {
     data class User(val id: UUID, val name: String)
 
     fun dropRequest(): ResponseEntity<PaymentSubmissionDto> {
-        val now = System.currentTimeMillis() + 30
+        val now = System.currentTimeMillis() + 2000
         return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).header("Retry-After", now.toString()).build()
     }
 
