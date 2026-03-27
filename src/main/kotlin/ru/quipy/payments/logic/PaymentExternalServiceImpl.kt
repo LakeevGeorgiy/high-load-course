@@ -9,6 +9,7 @@ import io.github.resilience4j.kotlin.circuitbreaker.executeSuspendFunction
 import io.github.resilience4j.kotlin.ratelimiter.executeSuspendFunction
 import io.github.resilience4j.ratelimiter.RateLimiter
 import io.github.resilience4j.ratelimiter.RateLimiterConfig
+import io.github.resilience4j.ratelimiter.RequestNotPermitted
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.java.Java
 import io.ktor.client.plugins.HttpRequestTimeoutException
@@ -20,15 +21,18 @@ import io.ktor.http.headers
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.DistributionSummary
 import io.micrometer.core.instrument.MeterRegistry
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
@@ -39,6 +43,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class PaymentDto(
@@ -69,12 +74,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val rateLimiter = RateLimiter.of("rate-limiter", RateLimiterConfig.custom()
-        .limitForPeriod(rateLimitPerSec)
-        .limitRefreshPeriod(Duration.ofMillis(1000))
-        .timeoutDuration(Duration.ofSeconds(10_000))
-        .build()
-    )
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec * 1L, Duration.ofSeconds(1))
 
     private val sent_to_bank: Counter = Counter
         .builder("sent_request_to_bank")
@@ -102,14 +102,14 @@ class PaymentExternalSystemAdapterImpl(
 
         // Если упало 10% запросов или 10% были медленными,
         // то открываем цепочку
-        .failureRateThreshold(8f)
-        .slowCallRateThreshold(8f)
+        .failureRateThreshold(10f)
+        .slowCallRateThreshold(10f)
         .slowCallDurationThreshold(Duration.ofMillis(800))
 
         // Переход из открытой цепочки в полуоткрытую
-        .waitDurationInOpenState(Duration.ofSeconds(15))
+        .waitDurationInOpenState(Duration.ofSeconds(1))
         // Переход из полуоткрытой в закрытую цепочку
-        .permittedNumberOfCallsInHalfOpenState(150)
+        .permittedNumberOfCallsInHalfOpenState(10)
         .automaticTransitionFromOpenToHalfOpenEnabled(true)
         .recordExceptions(Exception::class.java, HttpRequestTimeoutException::class.java)
         .build()
@@ -117,9 +117,16 @@ class PaymentExternalSystemAdapterImpl(
     private val circuitBreaker = CircuitBreaker.of("circuit-breaker", circuitBreakerConfig)
 
 
-    private val dispatcherClient = Executors.newFixedThreadPool(20).asCoroutineDispatcher()
-    private val dispatcherPayment = Executors.newFixedThreadPool(20).asCoroutineDispatcher()
+    private val dispatcherClient = Executors.newFixedThreadPool(40).asCoroutineDispatcher()
+    private val dispatcherPayment = Executors.newFixedThreadPool(40).asCoroutineDispatcher()
     private val clientTimeout = 10000000L
+
+    init {
+        circuitBreaker.eventPublisher
+            .onStateTransition { event ->
+                logger.error("[$accountName] CircuitBreaker transition: ${event.stateTransition}")
+            }
+    }
 
     private val client = HttpClient(Java) {
 
@@ -160,9 +167,10 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun calculateRetryDelay(retryCount: Int): Long {
-        val expBackoff = (1L shl (retryCount - 1).coerceAtMost(7)) * 5L
+        // 1 << (retrycCount - 1) * 10 + jitter
+        val expBackoff = (1L shl (retryCount - 1).coerceAtMost(8)) * 10L
         val jitter = ThreadLocalRandom.current().nextLong(0, 15)
-        return (expBackoff + jitter).coerceAtMost(500L)
+        return (expBackoff + jitter).coerceAtMost(3000L)
     }
 
     private suspend fun sendRequestWithRetry(
@@ -170,11 +178,11 @@ class PaymentExternalSystemAdapterImpl(
         url: String,
     ) {
 
-        val maxRetries = 6
+        val maxRetries = 100
         var curRetry = 1
 
         while (curRetry <= maxRetries) {
-            if (sendRequestWithLimiting(paymentDto, url, "")) {
+            if (sendHedgedRequest(paymentDto, url)) {
                 paymentESService.update(paymentDto.paymentId) {
                     it.logProcessing(true, now(), paymentDto.transactionId, reason = "success")
                 }
@@ -194,8 +202,52 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.error("Not successful request")
         paymentESService.update(paymentDto.paymentId) {
-            it.logProcessing(true, now(), paymentDto.transactionId, reason = "error")
+            it.logProcessing(false, now(), paymentDto.transactionId, reason = "error")
         }
+    }
+
+    suspend fun sendHedgedRequest(
+        paymentDto: PaymentDto,
+        url: String,
+    ): Boolean {
+
+        val idempotencyKey = UUID.randomUUID().toString()
+        val requestJob = SupervisorJob()
+        var result = AtomicBoolean(false)
+        val completed = AtomicBoolean(false)
+        val responseReceived = CompletableDeferred<Boolean>()
+
+        coroutineScope {
+            val primaryJob = launch(requestJob) {
+                val ok = sendRequestWithLimiting(paymentDto, url, idempotencyKey)
+                if (ok) {
+                    result.compareAndSet(false, true)
+                }
+                if (completed.compareAndSet(false, true)) {
+                    responseReceived.complete(true)
+                }
+            }
+
+            val hedgedJob = launch(requestJob) {
+                delay(90)
+                if (!completed.get()){
+                    hedgedRequest.increment()
+                    val ok = sendRequestWithLimiting(paymentDto, url, idempotencyKey)
+                    if (ok) {
+                        result.compareAndSet(false, true)
+                    }
+                    if (completed.compareAndSet(false, true)) {
+                        responseReceived.complete(true)
+                    }
+                }
+            }
+
+            val allJobs = listOf(primaryJob) + hedgedJob
+            if (completed.get()) {
+                allJobs.forEach { it.cancel() }
+            }
+        }
+        return result.get()
     }
 
     suspend fun sendRequestWithLimiting(
@@ -204,18 +256,15 @@ class PaymentExternalSystemAdapterImpl(
         idempotencyKey: String
     ): Boolean {
             semaphore.withPermit {
-                rateLimiter.executeSuspendFunction {
-
+                rateLimiter.tickBlocking()
                     sent_to_bank.increment()
-                    if (!circuitBreaker.tryAcquirePermission()) {
-                        return@executeSuspendFunction false
+                    while (!circuitBreaker.tryAcquirePermission()) {
+                        return false
                     }
 
-                    return@executeSuspendFunction sendRequest(paymentDto, url, idempotencyKey)
-
-                }
+                    return sendRequest(paymentDto, url, idempotencyKey)
             }
-        return false
+        return true
     }
 
     private suspend fun sendRequest(
@@ -226,6 +275,9 @@ class PaymentExternalSystemAdapterImpl(
         try {
             val response = client.post(url) {
                 setBody("")
+                headers {
+                    append("x-idempotency-key", idempotencyKey)
+                }
             }
 
             return handleSuccess(
