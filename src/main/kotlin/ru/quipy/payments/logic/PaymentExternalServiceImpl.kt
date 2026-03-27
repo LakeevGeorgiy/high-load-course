@@ -181,6 +181,7 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
             if (now() - paymentDto.paymentStartedAt >= clientTimeout) {
+                logger.error("Timeout - duration: ${now() - paymentDto.paymentStartedAt}")
                 paymentESService.update(paymentDto.paymentId) {
                     it.logProcessing(false, now(), paymentDto.transactionId, reason = "timeout")
                 }
@@ -193,7 +194,7 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.error("Not successful request")
         paymentESService.update(paymentDto.paymentId) {
-            it.logProcessing(false, now(), paymentDto.transactionId, reason = "error")
+            it.logProcessing(true, now(), paymentDto.transactionId, reason = "error")
         }
     }
 
@@ -202,35 +203,19 @@ class PaymentExternalSystemAdapterImpl(
         url: String,
         idempotencyKey: String
     ): Boolean {
-        var result = true
-        try {
             semaphore.withPermit {
                 rateLimiter.executeSuspendFunction {
 
                     sent_to_bank.increment()
                     if (!circuitBreaker.tryAcquirePermission()) {
-                        paymentESService.update(paymentDto.paymentId) {
-                            it.logProcessing(false, now(), paymentDto.transactionId, reason = "timeout")
-                        }
                         return@executeSuspendFunction false
                     }
 
-//                    circuitBreaker.executeSuspendFunction {
-                        return@executeSuspendFunction sendRequest(paymentDto, url, idempotencyKey)
-//                    }
+                    return@executeSuspendFunction sendRequest(paymentDto, url, idempotencyKey)
 
                 }
             }
-        } catch (e: CallNotPermittedException) {
-//            paymentESService.update(paymentDto.paymentId) {
-//                it.logProcessing(false, now(), paymentDto.transactionId, reason = "OPEN")
-//            }
-            return false
-        } catch (e: Exception) {
-//            logger.error("Exception while sending request")
-            result = false
-        }
-        return result
+        return false
     }
 
     private suspend fun sendRequest(
